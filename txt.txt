@@ -1,0 +1,459 @@
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	ccxt "github.com/ccxt/ccxt/go/v4"
+	"github.com/joho/godotenv"
+	"github.com/sirupsen/logrus"
+)
+
+var log = logrus.New()
+
+// Config holds all configuration for the application
+type Config struct {
+	APIKey       string
+	APISecret    string
+	Symbol       string
+	MinOrderSize float64
+	MaxOrderSize float64
+	MinGap       float64
+	MaxGap       float64
+	OrderCount   int
+	FillPercent  float64 // Percentage of orders to let execute (0-100)
+	DryRun       bool
+	LogLevel     string
+}
+
+func main() {
+	// Set up logging
+	log.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+	log.SetOutput(os.Stdout)
+	log.SetLevel(logrus.InfoLevel)
+
+	// Load configuration
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Set log level from config
+	level, err := logrus.ParseLevel(config.LogLevel)
+	if err == nil {
+		log.SetLevel(level)
+	}
+
+	// Print configuration (excluding sensitive data)
+	log.Infof("Starting Volume Trading Bot for MEXC")
+	log.Infof("Symbol: %s", config.Symbol)
+	log.Infof("Min Order Size: %f", config.MinOrderSize)
+	log.Infof("Max Order Size: %f", config.MaxOrderSize)
+	log.Infof("Min Gap: %f%%", config.MinGap)
+	log.Infof("Max Gap: %f%%", config.MaxGap)
+	log.Infof("Orders per Cycle: %d", config.OrderCount)
+	log.Infof("Fill Percent: %f%%", config.FillPercent)
+	log.Infof("Dry Run Mode: %v", config.DryRun)
+
+	// Initialize MEXC exchange
+	exchange := ccxt.NewMexc(map[string]interface{}{
+		"apiKey":          config.APIKey,
+		"secret":          config.APISecret,
+		"enableRateLimit": true,
+	})
+
+	// Set up signal handling for graceful shutdown
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Run the trading bot in a separate goroutine
+	stopChan := make(chan struct{})
+	go runTradingBot(exchange, config, stopChan)
+
+	// Wait for interrupt signal
+	<-signalChan
+	log.Info("Shutdown signal received")
+
+	// Trigger graceful shutdown
+	close(stopChan)
+	log.Info("Bot execution completed")
+}
+
+func loadConfig() (*Config, error) {
+	// Load .env file if it exists
+	_ = godotenv.Load()
+
+	// Load required configuration from environment variables
+	apiKey := os.Getenv("MEXC_API_KEY")
+	apiSecret := os.Getenv("MEXC_API_SECRET")
+
+	// Check for required fields
+	if apiKey == "" || apiSecret == "" {
+		return nil, fmt.Errorf("MEXC_API_KEY and MEXC_API_SECRET environment variables are required")
+	}
+
+	// Load optional configuration with defaults
+	symbol := getEnvWithDefault("SYMBOL", "BTC/USDT")
+	minOrderSize := getEnvAsFloat("MIN_ORDER_SIZE", 0.001)
+	maxOrderSize := getEnvAsFloat("MAX_ORDER_SIZE", 0.01)
+	minGap := getEnvAsFloat("MIN_GAP", 0.1)
+	maxGap := getEnvAsFloat("MAX_GAP", 0.5)
+	orderCount := getEnvAsInt("ORDER_COUNT", 5)
+	fillPercent := getEnvAsFloat("FILL_PERCENT", 20.0) // Default 20% of orders execute
+	dryRun := getEnvAsBool("DRY_RUN", true)
+	logLevel := getEnvWithDefault("LOG_LEVEL", "info")
+
+	return &Config{
+		APIKey:       apiKey,
+		APISecret:    apiSecret,
+		Symbol:       symbol,
+		MinOrderSize: minOrderSize,
+		MaxOrderSize: maxOrderSize,
+		MinGap:       minGap,
+		MaxGap:       maxGap,
+		OrderCount:   orderCount,
+		FillPercent:  fillPercent,
+		DryRun:       dryRun,
+		LogLevel:     logLevel,
+	}, nil
+}
+
+// generateRandomOrderSize returns a random order size between min and max
+func generateRandomOrderSize(min, max float64) float64 {
+	return min + rand.Float64()*(max-min)
+}
+
+// TradeOrder represents an order with its details for tracking
+type TradeOrder struct {
+	ID        string
+	Side      string
+	Price     float64
+	Size      float64
+	ToExecute bool // Whether this order should be allowed to execute
+}
+
+func runTradingBot(exchange ccxt.Mexc, config *Config, stopChan <-chan struct{}) {
+	// Initialize random number generator with a time-based seed
+	rand.Seed(time.Now().UnixNano())
+
+	// Variables to track our trading state
+	executedBuyVolume := 0.0
+	executedSellVolume := 0.0
+
+	// Load markets to ensure the exchange is ready
+	<-exchange.LoadMarkets()
+	log.Info("Markets loaded successfully")
+
+	// Main loop for the trading bot
+	for {
+		select {
+		case <-stopChan:
+			log.Info("Stopping trading bot")
+			return
+		default:
+			// Continue with trading strategy
+		}
+
+		// Step 1: Get order book
+		log.Infof("Fetching order book for %s", config.Symbol)
+		orderBook, err := exchange.FetchOrderBook(config.Symbol)
+		if err != nil {
+			log.Errorf("Failed to fetch order book: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		// Step 2: Find prices within the bid-ask spread
+		log.Info("Analyzing bid-ask spread for order placement")
+		buyPrices, sellPrices := findPricesInBidAskSpread(orderBook, config.OrderCount)
+
+		if len(buyPrices) == 0 && len(sellPrices) == 0 {
+			log.Info("No suitable prices found in the bid-ask spread. Waiting...")
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Infof("Found %d buy prices and %d sell prices in the bid-ask spread",
+			len(buyPrices), len(sellPrices))
+
+		// Track all placed orders
+		allOrders := make([]TradeOrder, 0)
+
+		// Step 3a: Place buy orders - decide which ones will be allowed to execute
+		if len(buyPrices) > 0 {
+			log.Infof("Placing %d buy orders in the bid-ask spread", len(buyPrices))
+
+			for i, price := range buyPrices {
+				// Generate random order size
+				orderSize := generateRandomOrderSize(config.MinOrderSize, config.MaxOrderSize)
+
+				// Decide if this order should be executed or cancelled
+				// For now, we ensure we have balanced buys and sells to execute
+				toExecute := rand.Float64() < (config.FillPercent/100.0) &&
+					executedBuyVolume < executedSellVolume+orderSize
+
+				if toExecute && !config.DryRun {
+					log.Infof("Placing buy order at price %f with size %f (WILL EXECUTE)", price, orderSize)
+				} else {
+					log.Infof("Placing buy order at price %f with size %f (will cancel)", price, orderSize)
+				}
+
+				if config.DryRun {
+					log.Info("Dry run mode: order not actually placed")
+					allOrders = append(allOrders, TradeOrder{
+						ID:        fmt.Sprintf("dry-run-buy-%d", i),
+						Side:      "buy",
+						Price:     price,
+						Size:      orderSize,
+						ToExecute: toExecute,
+					})
+					continue
+				}
+
+				// Create the buy order
+				order, err := exchange.CreateOrder(
+					config.Symbol,
+					"limit",
+					"buy",
+					orderSize,
+					ccxt.WithCreateOrderPrice(price),
+					ccxt.WithCreateOrderParams(map[string]interface{}{
+						"timeInForce": "GTC", // Good Till Canceled
+					}),
+				)
+
+				if err != nil {
+					log.Errorf("Failed to place buy order: %v", err)
+					continue
+				}
+
+				log.Infof("Buy order placed successfully: %s", *order.Id)
+
+				// Track the order
+				allOrders = append(allOrders, TradeOrder{
+					ID:        *order.Id,
+					Side:      "buy",
+					Price:     price,
+					Size:      orderSize,
+					ToExecute: toExecute,
+				})
+
+				// If this order will execute, update the executed volume
+				if toExecute && !config.DryRun {
+					executedBuyVolume += orderSize
+				}
+
+				// Add a small delay between orders to avoid rate limiting
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+
+		// Step 3b: Place sell orders
+		if len(sellPrices) > 0 {
+			log.Infof("Placing %d sell orders in the bid-ask spread", len(sellPrices))
+
+			for i, price := range sellPrices {
+				// Generate random order size
+				orderSize := generateRandomOrderSize(config.MinOrderSize, config.MaxOrderSize)
+
+				// Decide if this order should be executed or cancelled
+				// For now, we ensure we have balanced buys and sells to execute
+				toExecute := rand.Float64() < (config.FillPercent/100.0) &&
+					executedSellVolume < executedBuyVolume+orderSize
+
+				if toExecute && !config.DryRun {
+					log.Infof("Placing sell order at price %f with size %f (WILL EXECUTE)", price, orderSize)
+				} else {
+					log.Infof("Placing sell order at price %f with size %f (will cancel)", price, orderSize)
+				}
+
+				if config.DryRun {
+					log.Info("Dry run mode: order not actually placed")
+					allOrders = append(allOrders, TradeOrder{
+						ID:        fmt.Sprintf("dry-run-sell-%d", i),
+						Side:      "sell",
+						Price:     price,
+						Size:      orderSize,
+						ToExecute: toExecute,
+					})
+					continue
+				}
+
+				// Create the sell order
+				order, err := exchange.CreateOrder(
+					config.Symbol,
+					"limit",
+					"sell",
+					orderSize,
+					ccxt.WithCreateOrderPrice(price),
+					ccxt.WithCreateOrderParams(map[string]interface{}{
+						"timeInForce": "GTC", // Good Till Canceled
+					}),
+				)
+
+				if err != nil {
+					log.Errorf("Failed to place sell order: %v", err)
+					continue
+				}
+
+				log.Infof("Sell order placed successfully: %s", *order.Id)
+
+				// Track the order
+				allOrders = append(allOrders, TradeOrder{
+					ID:        *order.Id,
+					Side:      "sell",
+					Price:     price,
+					Size:      orderSize,
+					ToExecute: toExecute,
+				})
+
+				// If this order will execute, update the executed volume
+				if toExecute && !config.DryRun {
+					executedSellVolume += orderSize
+				}
+
+				// Add a small delay between orders to avoid rate limiting
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+
+		// Step 4: Wait for some orders to potentially execute
+		waitSeconds := 10
+		log.Infof("Waiting %d seconds to let orders potentially execute...", waitSeconds)
+		time.Sleep(time.Duration(waitSeconds) * time.Second)
+
+		// Step 5: Cancel orders that shouldn't execute
+		for _, order := range allOrders {
+			if order.ToExecute {
+				log.Infof("Allowing order %s to execute for filled volume", order.ID)
+				continue
+			}
+
+			log.Infof("Cancelling order %s at price %f", order.ID, order.Price)
+
+			if config.DryRun {
+				log.Info("Dry run mode: order not actually cancelled")
+				continue
+			}
+
+			// Cancel the order using the correct options pattern
+			_, err := exchange.CancelOrder(order.ID,
+				ccxt.WithCancelOrderSymbol(config.Symbol),
+				ccxt.WithCancelOrderParams(nil),
+			)
+			if err != nil {
+				log.Errorf("Failed to cancel order %s: %v", order.ID, err)
+				continue
+			}
+
+			log.Infof("Order %s cancelled successfully", order.ID)
+
+			// Add a small delay between cancellations to avoid rate limiting
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		// Step 6: Log information about what happened this cycle
+		log.Infof("Current trading state - Executed Buy Volume: %.8f, Executed Sell Volume: %.8f, Difference: %.8f",
+			executedBuyVolume, executedSellVolume, executedBuyVolume-executedSellVolume)
+
+		// Wait a bit before starting the next cycle
+		cycleWait := 30
+		log.Infof("Cycle completed. Waiting %d seconds before next cycle...", cycleWait)
+		time.Sleep(time.Duration(cycleWait) * time.Second)
+	}
+}
+
+// findPricesInBidAskSpread finds prices within the bid-ask spread
+// Returns prices that can be used for placing buy and sell orders
+func findPricesInBidAskSpread(orderBook ccxt.OrderBook, numLevels int) (buyPrices []float64, sellPrices []float64) {
+	// Check if we have valid bids and asks
+	if orderBook.Bids == nil || len(orderBook.Bids) == 0 ||
+		orderBook.Asks == nil || len(orderBook.Asks) == 0 {
+		return nil, nil
+	}
+
+	// Get the highest bid and lowest ask
+	highestBid := orderBook.Bids[0][0]
+	lowestAsk := orderBook.Asks[0][0]
+
+	// Calculate the spread
+	spread := lowestAsk - highestBid
+
+	// If the spread is too small, we can't place orders
+	if spread <= 0 {
+		return nil, nil
+	}
+
+	// Calculate number of price levels to create
+	// Add 1 to include both endpoints if needed
+	numPriceLevels := min(numLevels, 5) + 1
+
+	// Calculate step size between price levels
+	step := spread / float64(numPriceLevels)
+
+	// Generate price levels between highest bid and lowest ask
+	for i := 1; i < numPriceLevels; i++ {
+		// Calculate price at this level (move up from highest bid)
+		price := highestBid + (step * float64(i))
+
+		// Add to appropriate list based on proximity
+		if i < numPriceLevels/2 {
+			// Closer to bid - use for buy orders
+			buyPrices = append(buyPrices, price)
+		} else {
+			// Closer to ask - use for sell orders
+			sellPrices = append(sellPrices, price)
+		}
+	}
+
+	return buyPrices, sellPrices
+}
+
+// Helper functions for environment variables
+func getEnvWithDefault(key, defaultValue string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvAsFloat(key string, defaultValue float64) float64 {
+	if value, exists := os.LookupEnv(key); exists {
+		if parsed, err := strconv.ParseFloat(value, 64); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	if value, exists := os.LookupEnv(key); exists {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsBool(key string, defaultValue bool) bool {
+	if value, exists := os.LookupEnv(key); exists {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			return parsed
+		}
+	}
+	return defaultValue
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
